@@ -39,4 +39,7 @@ void mqttCallback(char* p_topic, byte* p_payload, unsigned int p_length) { //han
 The actual `irsend.sendXXX` value comes from recording the codes.
 If you have the IR receiver attached as i do, you can just use your remote and it will show you the exact code you need to put in here.
 
+### Kicad Schematic
+![Imgur](https://i.imgur.com/ww6XAlh.png "Schematic")
+
 ### Installation
