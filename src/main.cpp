@@ -1,8 +1,10 @@
-#include <ESP8266WiFi.h>
 #include <WiFiClient.h>
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <PubSubClient.h>
+#include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
-#include <Arduino.h>
 #include <secrets.h>
 
 // Add this library: https://github.com/markszabo/IRremoteESP8266
@@ -14,6 +16,13 @@
 #define IR_SEND_PIN D2
 #define TIMEOUT 15U  // Suits most messages, while not swallowing repeats.
 #define DELAY_BETWEEN_COMMANDS 1000
+#define MQTT_VERSION                        MQTT_VERSION_3_1_1
+
+const char* MQTT_CLIENT_ID =                "livingroom_ir";
+const char* MQTT_IR_TV_STATE_TOPIC =        "/house/livingroom/tv/status";
+const char* MQTT_IR_HIFI_STATE_TOPIC =      "/house/livingroom/hifi/status";
+const char* MQTT_IR_TV_COMMAND_TOPIC =      "/house/livingroom/tv/switch";
+const char* MQTT_IR_HIFI_COMMAND_TOPIC =    "/house/livingroom/hifi/switch";
 
 uint16_t RECV_PIN = 14;
 uint16_t CAPTURE_BUFFER_SIZE = 1024;
@@ -22,10 +31,8 @@ IRsend irsend(IR_SEND_PIN);
 IRrecv irrecv(RECV_PIN, CAPTURE_BUFFER_SIZE, TIMEOUT, true);
 
 decode_results results;  // Somewhere to store the results
-
-ESP8266WebServer server(80);
-
-const int led = BUILTIN_LED;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 void encoding(decode_results *results) {
   switch (results->decode_type) {
@@ -55,8 +62,15 @@ void encoding(decode_results *results) {
   if (results->repeat) Serial.print(" (Repeat)");
 }
 
-String rowDiv = "    <div class=\"row\" style=\"padding-bottom:1em\">\n";
-String endDiv = "    </div>\n";
+uint16_t getCookedLength(decode_results *results) {
+  uint16_t length = results->rawlen - 1;
+  for (uint16_t i = 0; i < results->rawlen - 1; i++) {
+    uint32_t usecs = results->rawbuf[i] * RAWTICK;
+    // Add two extra entries for multiple larger than UINT16_MAX it is.
+    length += (usecs / UINT16_MAX) * 2;
+  }
+  return length;
+}
 
 void dumpInfo(decode_results *results) {
   if (results->overflow)
@@ -74,16 +88,6 @@ void dumpInfo(decode_results *results) {
   Serial.print(" (");
   Serial.print(results->bits, DEC);
   Serial.println(" bits)");
-}
-
-uint16_t getCookedLength(decode_results *results) {
-  uint16_t length = results->rawlen - 1;
-  for (uint16_t i = 0; i < results->rawlen - 1; i++) {
-    uint32_t usecs = results->rawbuf[i] * RAWTICK;
-    // Add two extra entries for multiple larger than UINT16_MAX it is.
-    length += (usecs / UINT16_MAX) * 2;
-  }
-  return length;
 }
 
 void dumpRaw(decode_results *results) {
@@ -161,127 +165,118 @@ void dumpCode(decode_results *results) {
   }
 }
 
-String generateButton(String colSize, String id, String text, String url) {
-  return  "<div class=\"" + colSize + "\" style=\"text-align: center\">\n" +
-          "    <button id=\"" + id + "\" type=\"button\" class=\"btn btn-default\" style=\"width: 100%\" onclick='makeAjaxCall(\"" + url + "\")'>" + text + "</button>\n" +
-          "</div>\n";
-}
 
-void handleRoot() {
-  digitalWrite(led, 0);
-  String website = "<!DOCTYPE html>\n";
-  website = website + "<html>\n";
-  website = website + "  <head>\n";
-  website = website + "    <meta charset=\"utf-8\">\n";
-  website = website + "    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\n";
-  website = website + "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
-  website = website + "    <link rel=\"stylesheet\" href=\"https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css\">\n";
-  website = website + "  </head>\n";
-  website = website + "  <body>\n";
-  website = website + "    <div class=\"container-fluid\">\n";
-  // ------------------------- Power Controls --------------------------
-  website = website + rowDiv;
-  website = website + generateButton("col-xs-4", "tvpower","TV Power", "tvpower");
-  website = website + generateButton("col-xs-4", "hifipower","SS Power", "sspower");
-  website = website + endDiv;
-  // ------------------------- Volume Controls --------------------------
-  website = website + rowDiv;
-  website = website + generateButton("col-xs-12", "up","Vol Up", "up");
-  website = website + endDiv;
-  website = website + rowDiv;
-  website = website + generateButton("col-xs-12", "down","Vol Down", "down");
-  website = website + endDiv;
-
-  website = website + endDiv;
-  website = website + "    <script src=\"https://ajax.googleapis.com/ajax/libs/jquery/1.12.4/jquery.min.js\"></script>\n";
-  website = website + "    <script src=\"https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js\"></script>\n";
-  website = website + "    <script> function makeAjaxCall(url){$.ajax({\"url\": url})}</script>\n";
-  website = website + "  </body>\n";
-  website = website + "</html>\n";
-
-  server.send(200, "text/html", website);
-  digitalWrite(led, 1);
-}
-
-void handleNotFound(){
-  digitalWrite(led, 1);
-  String message = "File Not Found\n\n";
-  message += "URI: ";
-  message += server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET)?"GET":"POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-  for (uint8_t i=0; i<server.args(); i++){
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+void mqttReconnect() {
+  while (!mqttClient.connected()) { //loop until we're reconnected
+    Serial.print("[MQTT] INFO: Attempting connection to: ");
+    Serial.println(MQTT_SERVER_IP);
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+      Serial.println("[MQTT] INFO: connected");
+      Serial.print("[MQTT] INFO: subscribing to: ");
+      Serial.println(MQTT_IR_HIFI_COMMAND_TOPIC);
+      mqttClient.subscribe(MQTT_IR_HIFI_COMMAND_TOPIC);
+      Serial.print("[MQTT] INFO: subscribing to: ");
+      Serial.println(MQTT_IR_TV_COMMAND_TOPIC);
+      mqttClient.subscribe(MQTT_IR_TV_COMMAND_TOPIC);
+      }
+    else {
+      Serial.print("[MQTT] ERROR: failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println("[MQTT] DEBUG: try again in 5 seconds");
+      delay(5000); //wait 5 seconds before retrying
+    }
   }
-  server.send(404, "text/plain", message);
-  digitalWrite(led, 1);
 }
 
-void setup(void){
-  irsend.begin();
-  irrecv.enableIRIn();  // Start the receiver
-  pinMode(led, OUTPUT);
-  digitalWrite(led, 1);
-  Serial.begin(115200);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("");
-
-  // Wait for connection
+void wifiSetup() {
+  Serial.print("[WIFI] INFO: Connecting to ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); //connect to wifi
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(1000);
     Serial.print(".");
   }
   Serial.println("");
-  Serial.print("Connected to ");
-  Serial.println(WIFI_SSID);
-  Serial.print("IP address: ");
+  Serial.println("[WIFI] INFO: WiFi connected");
+  Serial.println("[WIFI] INFO: IP address: ");
   Serial.println(WiFi.localIP());
+}
 
-  if (MDNS.begin("esp8266")) {
-    Serial.println("MDNS Responder Started");
+void mqttCallback(char* p_topic, byte* p_payload, unsigned int p_length) { //handle mqtt callbacks
+  String payload;
+  for (uint8_t i = 0; i < p_length; i++) { //concatenate payload
+    payload.concat((char)p_payload[i]);
   }
 
-  server.on("/", handleRoot);
-
-  server.on("/down", [](){
-    Serial.println("Surround Sound Down");
-    irsend.sendNEC(0x10EF708F, 32);
-    server.send(200, "text/plain", "Volume Down");
-  });
-
-  server.on("/up", [](){
-    Serial.println("Surround Sound Up");
-    irsend.sendNEC(0x10EF58A7, 32);
-    server.send(200, "text/plain", "Volume Up");
-  });
-
-  server.on("/sspower", [](){
+  if(String(p_topic).equals(MQTT_IR_HIFI_COMMAND_TOPIC)) {
+    Serial.print("[MQTT] TOPIC: ");
+    Serial.println(p_topic);
+    Serial.print("[MQTT] PAYLOAD:");
+    Serial.println(payload);
     Serial.println("Surround Sound power");
     irsend.sendNEC(0x10EF08F7, 32);
-    server.send(200, "text/plain", "Surround Sound Power");
-  });
-
-  server.on("/tvpower", [](){
+    irsend.sendNEC(0x10EF08F7, 32);
+    irsend.sendNEC(0x10EF08F7, 32);
+  }
+  if(String(p_topic).equals(MQTT_IR_TV_COMMAND_TOPIC)) {
+    Serial.print("[MQTT] TOPIC: ");
+    Serial.println(p_topic);
+    Serial.print("[MQTT] PAYLOAD:");
+    Serial.println(payload);
     Serial.println("TV power");
     irsend.sendSAMSUNG(0xE0E040BF, 32);
-    server.send(200, "text/plain", "TV Power");
+  }
+  /* Serial.println("Surround Sound Down");
+  irsend.sendNEC(0x10EF708F, 32);
+  Serial.println("Surround Sound Up");
+  irsend.sendNEC(0x10EF58A7, 32); */
+}
+
+void setup(void){
+  Serial.begin(115200);
+  irsend.begin();
+  irrecv.enableIRIn();  // Start the receiver
+
+  ArduinoOTA.setHostname(MQTT_CLIENT_ID);
+  ArduinoOTA.onStart([]() {
+    String type;
+    type = "sketch";
+    Serial.println("Start updating " + type);
   });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
 
-  server.onNotFound(handleNotFound);
-
-  server.begin();
-  Serial.println("HTTP Server Started");
+  wifiSetup();
+  mqttClient.setServer(MQTT_SERVER_IP, MQTT_SERVER_PORT);
+  mqttClient.setCallback(mqttCallback);
+  Serial.println("");
 }
 
 void loop(void){
-  server.handleClient();
+  yield();
+  ArduinoOTA.handle();
+  if (!mqttClient.connected()) {
+    mqttReconnect();
+  }
+  mqttClient.loop();
   if (irrecv.decode(&results)) {
-  dumpInfo(&results);           // Output the results
-  dumpRaw(&results);            // Output the results in RAW format
-  dumpCode(&results);           // Output the results as source code
-  Serial.println("");           // Blank line between entries
+    dumpInfo(&results);           // Output the results
+    dumpRaw(&results);            // Output the results in RAW format
+    dumpCode(&results);           // Output the results as source code
+    Serial.println("");           // Blank line between entries
   }
 }
